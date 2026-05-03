@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from datetime import datetime
 import uuid
 from pydantic import BaseModel
@@ -7,13 +7,32 @@ from typing import Dict, Any, Optional, List
 app = FastAPI(title="Vera Challenge Bot", version="FINAL")
 
 # ===============================
-# Server start time
+# MODELS
+# ===============================
+class ReplyRequest(BaseModel):
+    message: str
+    merchant_id: str
+    conversation_id: str
+
+
+class ContextRequest(BaseModel):
+    scope: str
+    context_id: str
+    version: int
+    payload: Dict[str, Any]
+    delivered_at: Optional[str] = None
+
+
+class TickRequest(BaseModel):
+    now: str
+    available_triggers: List[str]
+
+
+# ===============================
+# GLOBALS
 # ===============================
 START_TIME = datetime.utcnow()
 
-# ===============================
-# In-memory storage
-# ===============================
 contexts = {
     "category": {},
     "merchant": {},
@@ -25,13 +44,15 @@ sent_keys = set()
 conversations = {}
 
 # ===============================
-# Helpers
+# HELPERS
 # ===============================
 def utc_now():
     return datetime.utcnow().isoformat() + "Z"
 
+
 def uptime_seconds():
     return int((datetime.utcnow() - START_TIME).total_seconds())
+
 
 def trigger_priority(kind):
     return {
@@ -44,6 +65,7 @@ def trigger_priority(kind):
         "research_digest": 7
     }.get(kind, 99)
 
+
 def category_goal(slug):
     return {
         "dentists": "patients",
@@ -53,125 +75,80 @@ def category_goal(slug):
         "pharmacies": "refills"
     }.get(slug, "customers")
 
+
 def trim(msg):
     return msg[:320]
 
+
 def build_suppression_key(trigger, now):
-    kind = trigger.get("kind", "unknown")
-    merchant_id = trigger.get("merchant_id", "unknown")
-    day = now[:10]
-    return f"{kind}:{merchant_id}:{day}"
+    return f"{trigger.get('kind')}:{trigger.get('merchant_id')}:{now[:10]}"
+
 
 # ===============================
-# Message Composer (FINAL BOOSTED)
+# DETECTION LOGIC
 # ===============================
-def compose_message(category, merchant, trigger, customer=None):
+STOP_WORDS = ["stop", "unsubscribe", "opt out", "remove me", "cancel", "end"]
+
+def is_stop(text):
+    return any(k in text.lower() for k in STOP_WORDS)
+
+
+def is_auto_reply(text):
+    auto_keywords = [
+        "out of office", "auto reply", "automatic reply",
+        "busy", "call later", "not available",
+        "away", "respond later"
+    ]
+    return any(k in text.lower() for k in auto_keywords)
+
+
+def detect_intent(text):
+    t = text.lower()
+
+    if any(k in t for k in ["yes", "yeah", "sure", "go ahead", "ok", "okay"]):
+        return "confirm"
+
+    if any(k in t for k in ["no", "not interested", "later", "no thanks"]):
+        return "reject"
+
+    if any(k in t for k in ["book", "schedule", "appointment"]):
+        return "booking"
+
+    if any(k in t for k in ["price", "cost", "offer"]):
+        return "pricing"
+
+    return "default"
+
+
+# ===============================
+# MESSAGE COMPOSER
+# ===============================
+def compose_message(category, merchant, trigger):
     kind = trigger.get("kind", "")
-    payload = trigger.get("payload", {})
-
     identity = merchant.get("identity", {})
+
     business = identity.get("name", "Your business")
     locality = identity.get("locality") or identity.get("city", "")
-    owner = identity.get("owner_first_name") or business
-
-    category_slug = merchant.get("category_slug", "")
-    goal = category_goal(category_slug)
-
-    performance = merchant.get("performance", {})
-    ctr = performance.get("ctr_pct")
-    peer_ctr = performance.get("peer_ctr_pct")
 
     offers = merchant.get("offers", [])
     top_offer = offers[0] if offers else {}
-    offer_name = top_offer.get("name")
+    offer_name = top_offer.get("name", "your best offer")
     offer_price = top_offer.get("price")
 
-    offer_str = f"{offer_name} @ ₹{offer_price}" if offer_name else "your best offer"
+    offer_str = f"{offer_name} @ ₹{offer_price}" if offer_price else offer_name
 
-    # =========================
-    # PERFORMANCE DIP
-    # =========================
-    if kind == "perf_dip" and ctr and peer_ctr:
-        gap = peer_ctr - ctr
-        loss_pct = int((gap / peer_ctr) * 100) if peer_ctr else 0
-
-        return trim(
-            f"{owner}, your CTR is {ctr:.1f}% vs {peer_ctr:.1f}% in {locality}. "
-            f"That’s ~{loss_pct}% fewer customers reaching you. "
-            f"Promote {offer_str} now to recover quickly. "
-            f"I can fix this in minutes."
-        )
-
-    # =========================
-    # COMPETITOR (IMPROVED)
-    # =========================
     if kind == "competitor_opened":
         return trim(
             f"{business}, a new competitor just opened in {locality}. "
-            f"Act now to protect your customers. "
-            f"Promote {offer_str} immediately to stay ahead. "
-            f"I can launch this in minutes."
-        )
-
-    # =========================
-    # FESTIVAL
-    # =========================
-    if kind == "festival_upcoming":
-        return trim(
-            f"{business}, demand is rising in {locality}. "
-            f"Promote {offer_str} now to capture more customers. "
-            f"I can launch this right away."
-        )
-
-    # =========================
-    # RENEWAL
-    # =========================
-    if kind == "renewal_due":
-        days = payload.get("days_remaining", 0)
-        plan = payload.get("plan", "Pro")
-
-        return trim(
-            f"{business}, your {plan} plan expires in {days} days. "
-            f"Renew now to avoid losing visibility and leads. "
-            f"I can renew this instantly."
-        )
-
-    # =========================
-    # RESEARCH
-    # =========================
-    if kind == "research_digest":
-        return trim(
-            f"{owner}, similar businesses in {locality} are growing faster. "
-            f"I can show what’s working right now."
-        )
-
-    # =========================
-    # REGULATION
-    # =========================
-    if kind == "regulation_change":
-        return trim(
-            f"{owner}, a recent update may impact your business in {locality}. "
-            f"I can help you stay compliant."
+            f"Act now to protect your customers. Promote {offer_str} immediately. "
+            f"Reply 'yes' and I’ll launch this instantly."
         )
 
     return trim(
-        f"{business}, I found ways to improve your {goal} in {locality}. "
-        f"I can help you grow faster."
+        f"{business}, I found a way to increase customers in {locality}. "
+        f"I recommend promoting {offer_str}. Reply 'yes' to launch now."
     )
 
-# ===============================
-# MODELS
-# ===============================
-class ContextRequest(BaseModel):
-    scope: str
-    context_id: str
-    version: int
-    payload: Dict[str, Any]
-    delivered_at: Optional[str] = None
-
-class TickRequest(BaseModel):
-    now: str
-    available_triggers: List[str]
 
 # ===============================
 # ENDPOINTS
@@ -184,13 +161,15 @@ def healthz():
         "contexts_loaded": {k: len(v) for k, v in contexts.items()}
     }
 
+
 @app.get("/v1/metadata")
 def metadata():
     return {
         "team_name": "Aiyman",
         "version": "1.0",
-        "approach": "Priority-based trigger system + contextual messaging"
+        "approach": "Trigger prioritization + contextual CTA messaging"
     }
+
 
 @app.post("/v1/context")
 async def context(data: ContextRequest):
@@ -198,117 +177,185 @@ async def context(data: ContextRequest):
         return {"accepted": False}
 
     contexts[data.scope][data.context_id] = {
-        "version": data.version,
         "payload": data.payload,
-        "delivered_at": data.delivered_at or utc_now()
+        "version": data.version
     }
 
     return {
         "accepted": True,
-        "ack_id": f"ack_{uuid.uuid4().hex[:8]}",
-        "stored_at": utc_now()
+        "ack_id": f"ack_{uuid.uuid4().hex[:8]}"
     }
 
+
 # ===============================
-# FINAL TICK
+# TICK
 # ===============================
 @app.post("/v1/tick")
 async def tick(data: TickRequest):
 
     now = data.now
-    available_triggers = data.available_triggers or []
-
     actions = []
-    collected = []
 
-    # Collect triggers
     for trigger_id, trigger_data in contexts["trigger"].items():
-        if trigger_id in available_triggers:
-            payload = trigger_data.get("payload", {})
-            payload["id"] = trigger_id
-            collected.append(payload)
 
-    # Sort by priority
-    collected.sort(key=lambda x: trigger_priority(x.get("kind")))
-
-    merchant_action_count = {}
-
-    for t in collected:
-        if len(actions) >= 20:
-            break
-
-        merchant_id = t.get("merchant_id")
-        if not merchant_id:
+        if trigger_id not in data.available_triggers:
             continue
 
-        count = merchant_action_count.get(merchant_id, 0)
-        if count >= 1 and trigger_priority(t.get("kind")) > 2:
-            continue
-
-        sk = build_suppression_key(t, now)
-        if sk in sent_keys:
-            continue
+        payload = trigger_data.get("payload", {})
+        merchant_id = payload.get("merchant_id")
 
         merchant_data = contexts["merchant"].get(merchant_id)
         if not merchant_data:
             continue
 
         merchant = merchant_data["payload"]
-        category_slug = merchant.get("category_slug")
-        category = contexts["category"].get(category_slug, {}).get("payload", {})
+        category = contexts["category"].get(
+            merchant.get("category_slug"), {}
+        ).get("payload", {})
 
-        body = compose_message(category, merchant, t)
-
-        kind = t.get("kind", "")
-
-        # ✅ FIXED CTA LOGIC
-        if kind in ["research_digest", "regulation_change"]:
-            cta = "open_ended"
-        else:
-            cta = "reply"
+        body = compose_message(category, merchant, payload)
 
         action = {
-            "conversation_id": f"conv_{t['id']}",
+            "conversation_id": f"conv_{trigger_id}",
             "merchant_id": merchant_id,
-            "customer_id": t.get("customer_id"),
+            "customer_id": None,
             "send_as": "vera",
-            "trigger_id": t["id"],
-            "template_name": kind,
+            "trigger_id": trigger_id,
+            "template_name": payload.get("kind"),
             "template_params": [],
             "body": body,
-            "cta": cta,
-            "suppression_key": sk,
-            "rationale": f"{kind} triggered due to real-time signals"
+            "cta": "reply",
+            "suppression_key": build_suppression_key(payload, now),
+            "rationale": "trigger-based action"
         }
 
         actions.append(action)
-        sent_keys.add(sk)
-        merchant_action_count[merchant_id] = count + 1
+
+        if len(actions) >= 20:
+            break
 
     return {"actions": actions}
 
+
 # ===============================
-# REPLY
+# REPLY (FINAL FIXED)
 # ===============================
 @app.post("/v1/reply")
-async def reply(request: Request):
-    data = await request.json()
-    text = data.get("message", "").lower()
+async def reply(data: ReplyRequest):
 
-    if "yes" in text:
-        return {"action": "send", "body": "Great, setting it up now."}
+    text = data.message.strip()
+    merchant_id = data.merchant_id
+    conversation_id = data.conversation_id
 
-    if "price" in text:
-        return {"action": "send", "body": "I can show pricing options. Want to see?"}
+    # STOP FIRST
+    if is_stop(text):
+        return {
+            "actions": [
+                {
+                    "type": "end",
+                    "reason": "user_opt_out",
+                    "final": True
+                }
+            ]
+        }
 
-    if "later" in text:
-        return {"action": "wait", "body": "No problem, I’ll check later."}
+    # AUTO REPLY
+    if is_auto_reply(text):
+        return {"actions": []}
 
-    if "no" in text:
-        return {"action": "end", "body": "Understood."}
+    intent = detect_intent(text)
 
-    return {"action": "send", "body": "How can I help you grow your business?"}
+    merchant = contexts["merchant"].get(merchant_id, {}).get("payload", {})
+    identity = merchant.get("identity", {})
 
+    business = identity.get("name", "your business")
+    locality = identity.get("locality") or identity.get("city", "")
+
+    offers = merchant.get("offers", [])
+    top_offer = offers[0] if offers else {}
+    offer_name = top_offer.get("name", "your best offer")
+    offer_price = top_offer.get("price")
+
+    offer_str = f"{offer_name} @ ₹{offer_price}" if offer_price else offer_name
+
+    # =========================
+    # CONFIRM
+    # =========================
+    if intent == "confirm":
+        return {
+            "actions": [
+                {
+                    "type": "send",
+                    "conversation_id": conversation_id,
+                    "body": f"Great, launching {offer_str} for {business} in {locality}. You’ll start seeing results shortly."
+                },
+                {
+                    "type": "end",
+                    "reason": "completed"
+                }
+            ]
+        }
+
+    # =========================
+    # BOOKING
+    # =========================
+    if intent == "booking":
+        return {
+            "actions": [
+                {
+                    "type": "send",
+                    "conversation_id": conversation_id,
+                    "body": f"Got it. I’ll schedule this for {business} right away."
+                }
+            ]
+        }
+
+    # =========================
+    # PRICING
+    # =========================
+    if intent == "pricing":
+        return {
+            "actions": [
+                {
+                    "type": "send",
+                    "conversation_id": conversation_id,
+                    "body": f"I can optimize pricing for {business} in {locality} to increase conversions. Want me to proceed?"
+                }
+            ]
+        }
+
+    # =========================
+    # REJECT
+    # =========================
+    if intent == "reject":
+        return {
+            "actions": [
+                {
+                    "type": "end",
+                    "reason": "user_not_interested"
+                }
+            ]
+        }
+
+    # =========================
+    # DEFAULT (HIGH ENGAGEMENT)
+    # =========================
+    return {
+        "actions": [
+            {
+                "type": "send",
+                "conversation_id": conversation_id,
+                "body": f"{business} in {locality} can get more customers this week. "
+                        f"I recommend promoting {offer_str} now. "
+                        f"Reply 'yes' and I’ll launch it instantly."
+            }
+        ]
+    }
+
+
+# ===============================
+# RUN
+# ===============================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
